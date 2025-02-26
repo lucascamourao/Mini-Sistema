@@ -12,10 +12,11 @@
 #define BLOCK_SIZE 4096
 #define FILE_NAME_SIZE 32
 #define MAX_FILES 1024
+#define SWAP_SIZE 104857600 // 100 MB para área de swap
 
-// Definição para Huge Page
-#define HUGE_PAGE_SIZE (2 * 1024 * 1024)               // 2 MB
-#define CAPACIDADE (HUGE_PAGE_SIZE / sizeof(uint32_t)) // 524288 elementos
+// Definições para Huge Page
+#define HUGE_PAGE_SIZE (2 * 1024 * 1024)
+#define CAPACIDADE (HUGE_PAGE_SIZE / sizeof(uint32_t))
 
 // Declarações externas para as funções de gerenciamento de huge page (implementadas em memoria.c)
 extern void *alocar_huge_page();
@@ -37,15 +38,67 @@ typedef struct
     int free_blocks[DISK_SIZE / BLOCK_SIZE]; // Bitmap de blocos livres
 } FileSystem;
 
+typedef struct
+{
+    int start_block;
+    int num_blocks;
+    int num_elements;
+} RunInfo;
+
 FileSystem fs;
 int disk_fd;
+
+void verificar_config_hugepage()
+{
+    printf("\nERRO: Configuração necessária:\n");
+    printf("1. Reserve 1 Huge Page (2MB):\n");
+    printf("   sudo sysctl vm.nr_hugepages=1\n");
+    printf("2. Verifique permissões no diretório /dev/hugepages\n\n");
+}
 
 // Inicializa o sistema de arquivos
 void initialize_filesystem()
 {
-    fs.file_count = 0; // inicia o contador como 0, já que não tem nenhum arquivo criado
+    fs.file_count = 0;
     memset(fs.files, 0, sizeof(fs.files));
     memset(fs.free_blocks, 0, sizeof(fs.free_blocks));
+
+    // Reservar área de swap
+    int swap_start_block = (DISK_SIZE - SWAP_SIZE) / BLOCK_SIZE;
+    int swap_blocks = SWAP_SIZE / BLOCK_SIZE;
+    for (int i = swap_start_block; i < swap_start_block + swap_blocks; i++)
+    {
+        fs.free_blocks[i] = 1;
+    }
+}
+
+int allocate_swap_blocks(int blocks_needed)
+{
+    int swap_start = (DISK_SIZE - SWAP_SIZE) / BLOCK_SIZE;
+    for (int i = swap_start; i <= (DISK_SIZE / BLOCK_SIZE) - blocks_needed; i++)
+    {
+        int j;
+        for (j = i; j < i + blocks_needed; j++)
+        {
+            if (fs.free_blocks[j] != 0)
+                break;
+        }
+        if (j == i + blocks_needed)
+        {
+            for (int k = i; k < i + blocks_needed; k++)
+                fs.free_blocks[k] = 1;
+            return i;
+        }
+    }
+    return -1;
+}
+
+void free_swap_blocks(int start_block, int num_blocks)
+{
+    for (int i = start_block; i < start_block + num_blocks; i++)
+    {
+        fs.free_blocks[i] = 0;
+    }
 }
 
 /* Cria um arquivo com uma lista aleatória de números inteiros positivos de 32 bits.
@@ -58,12 +111,10 @@ void criar(const char *nome, int tam)
         return;
     }
 
-    // Calcula o número de blocos necessários
     int blocks_needed = (tam * sizeof(uint32_t) + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    int total_blocks = DISK_SIZE / BLOCK_SIZE; // Total de blocos no sistema
+    int total_blocks = (DISK_SIZE - SWAP_SIZE) / BLOCK_SIZE; // Ignorar área de swap
     int start_block = -1;
 
-    // Procura blocos contíguos livres
     for (int i = 0; i <= total_blocks - blocks_needed; i++)
     {
         int j;
@@ -85,27 +136,23 @@ void criar(const char *nome, int tam)
         return;
     }
 
-    // Marca blocos como ocupados
     for (int i = start_block; i < start_block + blocks_needed; i++)
     {
         fs.free_blocks[i] = 1;
     }
 
-    // Cria a entrada do arquivo
     strncpy(fs.files[fs.file_count].name, nome, FILE_NAME_SIZE);
-    fs.files[fs.file_count].size = tam * sizeof(uint32_t); // Usa uint32_t
+    fs.files[fs.file_count].size = tam * sizeof(uint32_t);
     fs.files[fs.file_count].start_block = start_block;
     fs.file_count++;
 
-    // Gera números aleatórios de 32 bits e escreve no disco
     lseek(disk_fd, start_block * BLOCK_SIZE, SEEK_SET);
     for (int i = 0; i < tam; i++)
     {
         uint32_t num = 0;
-        // Preenche os 32 bits (4 bytes) com valores aleatórios
         for (int j = 0; j < 4; j++)
         {
-            num = (num << 8) | (rand() % 256); // Byte aleatório (0-255)
+            num = (num << 8) | (rand() % 256);
         }
         write(disk_fd, &num, sizeof(uint32_t));
     }
@@ -170,101 +217,47 @@ int comparar_int32(const void *a, const void *b)
     return (n1 > n2) - (n1 < n2);
 }
 
-/* Função auxiliar: realiza o merge de dois arquivos de runs ordenados.
-   Utiliza a Huge Page (huge_buffer) como buffer de saída com capacidade 'capacidade' (em número de inteiros).
-   Retorna (via strdup) o nome do arquivo temporário resultante do merge. */
-static char *merge_two_runs(const char *file1, const char *file2, int32_t *huge_buffer, size_t capacidade)
+RunInfo merge_two_runs(RunInfo run1, RunInfo run2, int32_t *buffer)
 {
-    int fd1 = open(file1, O_RDONLY);
-    int fd2 = open(file2, O_RDONLY);
-    if (fd1 == -1 || fd2 == -1)
+    RunInfo merged;
+    merged.num_elements = run1.num_elements + run2.num_elements;
+    int bytes_needed = merged.num_elements * sizeof(int32_t);
+    merged.num_blocks = (bytes_needed + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    merged.start_block = allocate_swap_blocks(merged.num_blocks);
+    if (merged.start_block == -1)
     {
-        perror("Erro ao abrir arquivo para merge");
-        if (fd1 != -1)
-            close(fd1);
-        if (fd2 != -1)
-            close(fd2);
-        return NULL;
+        merged.num_blocks = 0;
+        return merged;
     }
-    char template[] = "/tmp/runXXXXXX";
-    int out_fd = mkstemp(template);
-    if (out_fd == -1)
+
+    int32_t *data1 = malloc(run1.num_elements * sizeof(int32_t));
+    int32_t *data2 = malloc(run2.num_elements * sizeof(int32_t));
+
+    lseek(disk_fd, run1.start_block * BLOCK_SIZE, SEEK_SET);
+    read(disk_fd, data1, run1.num_elements * sizeof(int32_t));
+    lseek(disk_fd, run2.start_block * BLOCK_SIZE, SEEK_SET);
+    read(disk_fd, data2, run2.num_elements * sizeof(int32_t));
+
+    int i = 0, j = 0, k = 0;
+    while (i < run1.num_elements && j < run2.num_elements)
     {
-        perror("Erro ao criar arquivo temporário para merge");
-        close(fd1);
-        close(fd2);
-        return NULL;
+        buffer[k++] = (data1[i] <= data2[j]) ? data1[i++] : data2[j++];
     }
-    size_t out_index = 0;
-    int32_t a, b;
-    int tem_a = (read(fd1, &a, sizeof(int32_t)) == sizeof(int32_t));
-    int tem_b = (read(fd2, &b, sizeof(int32_t)) == sizeof(int32_t));
-    while (tem_a && tem_b)
-    {
-        if (a <= b)
-        {
-            huge_buffer[out_index++] = a;
-            if (out_index == capacidade)
-            {
-                if (write(out_fd, huge_buffer, capacidade * sizeof(int32_t)) != (ssize_t)(capacidade * sizeof(int32_t)))
-                {
-                    perror("Erro ao escrever run merged");
-                }
-                out_index = 0;
-            }
-            tem_a = (read(fd1, &a, sizeof(int32_t)) == sizeof(int32_t));
-        }
-        else
-        {
-            huge_buffer[out_index++] = b;
-            if (out_index == capacidade)
-            {
-                if (write(out_fd, huge_buffer, capacidade * sizeof(int32_t)) != (ssize_t)(capacidade * sizeof(int32_t)))
-                {
-                    perror("Erro ao escrever run merged");
-                }
-                out_index = 0;
-            }
-            tem_b = (read(fd2, &b, sizeof(int32_t)) == sizeof(int32_t));
-        }
-    }
-    while (tem_a)
-    {
-        huge_buffer[out_index++] = a;
-        if (out_index == capacidade)
-        {
-            if (write(out_fd, huge_buffer, capacidade * sizeof(int32_t)) != (ssize_t)(capacidade * sizeof(int32_t)))
-            {
-                perror("Erro ao escrever run merged");
-            }
-            out_index = 0;
-        }
-        tem_a = (read(fd1, &a, sizeof(int32_t)) == sizeof(int32_t));
-    }
-    while (tem_b)
-    {
-        huge_buffer[out_index++] = b;
-        if (out_index == capacidade)
-        {
-            if (write(out_fd, huge_buffer, capacidade * sizeof(int32_t)) != (ssize_t)(capacidade * sizeof(int32_t)))
-            {
-                perror("Erro ao escrever run merged");
-            }
-            out_index = 0;
-        }
-        tem_b = (read(fd2, &b, sizeof(int32_t)) == sizeof(int32_t));
-    }
-    if (out_index > 0)
-    {
-        if (write(out_fd, huge_buffer, out_index * sizeof(int32_t)) != (ssize_t)(out_index * sizeof(int32_t)))
-        {
-            perror("Erro ao escrever run merged");
-        }
-    }
-    close(fd1);
-    close(fd2);
-    close(out_fd);
-    return strdup(template);
+    while (i < run1.num_elements)
+        buffer[k++] = data1[i++];
+    while (j < run2.num_elements)
+        buffer[k++] = data2[j++];
+
+    lseek(disk_fd, merged.start_block * BLOCK_SIZE, SEEK_SET);
+    write(disk_fd, buffer, bytes_needed);
+
+    free_swap_blocks(run1.start_block, run1.num_blocks);
+    free_swap_blocks(run2.start_block, run2.num_blocks);
+    free(data1);
+    free(data2);
+
+    return merged;
 }
 
 /* Função ordenar:
@@ -288,156 +281,94 @@ void ordenar(const char *nome)
         printf("Arquivo '%s' não encontrado.\n", nome);
         return;
     }
-    FileEntry *file = &fs.files[file_idx];
-    int total_bytes = file->size;
-    int total_elementos = total_bytes / sizeof(int32_t);
 
-    // Aloca a Huge Page para uso exclusivo na ordenação
+    FileEntry *file = &fs.files[file_idx];
+    int total_elementos = file->size / sizeof(int32_t);
     int32_t *huge_buffer = (int32_t *)alocar_huge_page();
+
     if (!huge_buffer)
     {
-        printf("Falha ao alocar memória para ordenação. Operação cancelada.\n");
+        verificar_config_hugepage();
+        printf("Falha crítica: Não foi possível alocar a Huge Page!\n");
         return;
     }
 
-    // Ordenação in-memory (se o arquivo couber na Huge Page)
+    int precisa_liberar = 1;
+
     if (total_elementos <= CAPACIDADE)
     {
         lseek(disk_fd, file->start_block * BLOCK_SIZE, SEEK_SET);
-        if (read(disk_fd, huge_buffer, total_bytes) != total_bytes)
-        {
-            perror("Erro ao ler arquivo");
-            liberar_huge_page(huge_buffer);
-            return;
-        }
-        clock_t inicio = clock();
+        read(disk_fd, huge_buffer, file->size);
         qsort(huge_buffer, total_elementos, sizeof(int32_t), comparar_int32);
-        clock_t fim = clock();
         lseek(disk_fd, file->start_block * BLOCK_SIZE, SEEK_SET);
-        if (write(disk_fd, huge_buffer, total_bytes) != total_bytes)
-        {
-            perror("Erro ao escrever arquivo ordenado");
-        }
-        double tempo = (double)(fim - inicio) * 1000 / CLOCKS_PER_SEC;
-        printf("Arquivo '%s' ordenado em %.2f ms.\n", nome, tempo);
-        liberar_huge_page(huge_buffer);
-        return;
+        write(disk_fd, huge_buffer, file->size);
+        goto cleanup;
     }
 
-    // Ordenação externa usando paginação (arquivo maior que a capacidade da Huge Page)
     clock_t inicio = clock();
     int num_runs = (total_elementos + CAPACIDADE - 1) / CAPACIDADE;
-    char **run_files = malloc(num_runs * sizeof(char *));
-    if (!run_files)
-    {
-        perror("Erro de alocação");
-        liberar_huge_page(huge_buffer);
-        return;
-    }
-    // Cria as runs ordenadas
+    RunInfo *runs = malloc(num_runs * sizeof(RunInfo));
+
     for (int i = 0; i < num_runs; i++)
     {
-        int elem_run = (i < num_runs - 1) ? CAPACIDADE : (total_elementos - i * CAPACIDADE);
-        off_t offset = file->start_block * BLOCK_SIZE + i * CAPACIDADE * sizeof(int32_t);
+        int elementos = (i == num_runs - 1) ? (total_elementos % CAPACIDADE) : CAPACIDADE;
+        off_t offset = file->start_block * BLOCK_SIZE + (i * CAPACIDADE * sizeof(int32_t));
+
         lseek(disk_fd, offset, SEEK_SET);
-        if (read(disk_fd, huge_buffer, elem_run * sizeof(int32_t)) != elem_run * sizeof(int32_t))
-        {
-            perror("Erro ao ler para run");
-            for (int j = 0; j < i; j++)
-                free(run_files[j]);
-            free(run_files);
-            liberar_huge_page(huge_buffer);
-            return;
-        }
-        qsort(huge_buffer, elem_run, sizeof(int32_t), comparar_int32);
-        char template[] = "/tmp/runXXXXXX";
-        int fd = mkstemp(template);
-        if (fd == -1)
-        {
-            perror("Erro ao criar arquivo temporário");
-            for (int j = 0; j < i; j++)
-                free(run_files[j]);
-            free(run_files);
-            liberar_huge_page(huge_buffer);
-            return;
-        }
-        if (write(fd, huge_buffer, elem_run * sizeof(int32_t)) != elem_run * sizeof(int32_t))
-        {
-            perror("Erro ao escrever run");
-            close(fd);
-            for (int j = 0; j < i; j++)
-                free(run_files[j]);
-            free(run_files);
-            liberar_huge_page(huge_buffer);
-            return;
-        }
-        close(fd);
-        run_files[i] = strdup(template);
-        if (!run_files[i])
-        {
-            perror("Erro ao duplicar nome de arquivo");
-        }
+        read(disk_fd, huge_buffer, elementos * sizeof(int32_t));
+        qsort(huge_buffer, elementos, sizeof(int32_t), comparar_int32);
+
+        int blocos = (elementos * sizeof(int32_t) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        int bloco_inicial = allocate_swap_blocks(blocos);
+
+        lseek(disk_fd, bloco_inicial * BLOCK_SIZE, SEEK_SET);
+        write(disk_fd, huge_buffer, elementos * sizeof(int32_t));
+
+        runs[i] = (RunInfo){bloco_inicial, blocos, elementos};
     }
-    // Merge externo: mescla as runs de duas em duas até obter uma única run final
-    int runs_correntes = num_runs;
-    while (runs_correntes > 1)
+
+    while (num_runs > 1)
     {
-        int new_runs = (runs_correntes + 1) / 2;
-        char **new_run_files = malloc(new_runs * sizeof(char *));
-        if (!new_run_files)
+        int new_runs = (num_runs + 1) / 2;
+        RunInfo *new_runs_arr = malloc(new_runs * sizeof(RunInfo));
+
+        for (int i = 0; i < num_runs; i += 2)
         {
-            perror("Erro de alocação durante merge");
-            break;
-        }
-        int new_index = 0;
-        for (int i = 0; i < runs_correntes; i += 2)
-        {
-            if (i + 1 < runs_correntes)
+            if (i + 1 >= num_runs)
             {
-                char *merged = merge_two_runs(run_files[i], run_files[i + 1], huge_buffer, CAPACIDADE);
-                unlink(run_files[i]);
-                unlink(run_files[i + 1]);
-                free(run_files[i]);
-                free(run_files[i + 1]);
-                new_run_files[new_index++] = merged;
+                new_runs_arr[i / 2] = runs[i];
+                continue;
             }
-            else
-            {
-                new_run_files[new_index++] = run_files[i];
-            }
+            new_runs_arr[i / 2] = merge_two_runs(runs[i], runs[i + 1], huge_buffer);
         }
-        free(run_files);
-        run_files = new_run_files;
-        runs_correntes = new_runs;
+
+        free(runs);
+        runs = new_runs_arr;
+        num_runs = new_runs;
     }
-    // Escreve o arquivo ordenado de volta no disco virtual
-    int final_fd = open(run_files[0], O_RDONLY);
-    if (final_fd == -1)
+
+    if (runs[0].num_elements != total_elementos)
     {
-        perror("Erro ao abrir run final");
-        free(run_files[0]);
-        free(run_files);
-        liberar_huge_page(huge_buffer);
-        return;
+        printf("Erro: Dados corrompidos durante a ordenação!\n");
+        goto cleanup;
     }
+
+    lseek(disk_fd, runs[0].start_block * BLOCK_SIZE, SEEK_SET);
+    read(disk_fd, huge_buffer, runs[0].num_elements * sizeof(int32_t));
     lseek(disk_fd, file->start_block * BLOCK_SIZE, SEEK_SET);
-    ssize_t bytes_lidos;
-    while ((bytes_lidos = read(final_fd, huge_buffer, HUGE_PAGE_SIZE)) > 0)
+    write(disk_fd, huge_buffer, file->size);
+
+    free_swap_blocks(runs[0].start_block, runs[0].num_blocks);
+    free(runs);
+
+    printf("Ordenação concluída em %.2f ms\n",
+           (double)(clock() - inicio) * 1000 / CLOCKS_PER_SEC);
+
+cleanup:
+    if (precisa_liberar)
     {
-        if (write(disk_fd, huge_buffer, bytes_lidos) != bytes_lidos)
-        {
-            perror("Erro ao escrever arquivo final no disco");
-            break;
-        }
+        liberar_huge_page(huge_buffer);
     }
-    close(final_fd);
-    unlink(run_files[0]);
-    free(run_files[0]);
-    free(run_files);
-    clock_t fim = clock();
-    double tempo = (double)(fim - inicio) * 1000 / CLOCKS_PER_SEC;
-    printf("Arquivo '%s' ordenado em %.2f ms (externo).\n", nome, tempo);
-    liberar_huge_page(huge_buffer);
 }
 
 void ler(const char *nome, int inicio, int fim)
@@ -632,33 +563,32 @@ void concatenar(const char *nome1, const char *nome2)
 // Inicializa o sistema de arquivos
 void sistema_arquivos()
 {
-    // Cria ou abre o arquivo de disco virtual
     disk_fd = open("disco_virtual.img", O_RDWR | O_CREAT, 0644);
     if (disk_fd < 0)
     {
-        perror("Erro ao abrir o disco virtual");
+        perror("Erro ao abrir disco virtual");
         exit(EXIT_FAILURE);
     }
 
-    // Verifica o tamanho do arquivo
-    off_t size = lseek(disk_fd, 0, SEEK_END);
-
-    // Se for um novo arquivo, expande para o tamanho desejado
-    if (size < DISK_SIZE)
+    // Verificação inicial de Huge Page
+    void *test_page = alocar_huge_page();
+    if (!test_page)
     {
-        printf("Inicializando disco virtual com tamanho de 1GB...\n");
-        // Posiciona no final do arquivo
-        lseek(disk_fd, DISK_SIZE - 1, SEEK_SET);
-        // Escreve um byte para forçar a alocação do espaço
-        char zero = 0;
-        write(disk_fd, &zero, 1);
+        verificar_config_hugepage();
+        close(disk_fd);
+        exit(EXIT_FAILURE);
     }
+    liberar_huge_page(test_page);
 
-    // Volta para o início do arquivo
-    lseek(disk_fd, 0, SEEK_SET);
+    // Verificar tamanho do disco
+    if (lseek(disk_fd, DISK_SIZE - 1, SEEK_SET) == -1)
+    {
+        perror("Erro ao configurar disco");
+        close(disk_fd);
+        exit(EXIT_FAILURE);
+    }
+    write(disk_fd, "", 1);
 
-    // Inicializa o sistema de arquivos
     initialize_filesystem();
-
-    printf("Sistema de arquivos inicializado.\n");
+    printf("Sistema inicializado. Huge Page configurada com sucesso.\n");
 }
