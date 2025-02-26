@@ -1,0 +1,11 @@
+Funcionalidades Implementadas
+
+- Criação de arquivos: Gera arquivos com números aleatórios.
+- Exclusão de arquivos: Remove arquivos do sistema.
+- Listagem de arquivos: Mostra os arquivos e seus tamanhos.
+- Gerenciamento de memória: Aloca e libera uma "Huge Page" de 2 MB.
+
+Falta:
+
+- Implementar a ordenação de arquivos usando a "Huge Page"
+- Adicionar funcionalidades de leitura, concatenação e paginação.
